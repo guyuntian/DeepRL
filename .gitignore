@@ -1,0 +1,6 @@
+__pycache__
+.ex*
+.ipynb*
+envs/
+exp/
+slurm*
