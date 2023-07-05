@@ -14,7 +14,7 @@ def check_dir(cur_dir):
 
 
 def copy_file(src_dir, tar_dir):
-    # cmd = 'sudo cp %s %s' % (src_dir, tar_dir)
+    # cmd = 'cp %s %s' % (src_dir, tar_dir)
     cmd = 'copy %s %s' % (src_dir, tar_dir)
     subprocess.check_call(cmd, shell=True)
 
@@ -99,7 +99,6 @@ class Trainer():
         self.model = model
         self.n_step = self.model.n_step
         self.summary_writer = summary_writer
-        print(self.env.T, self.n_step)
         assert self.env.T % self.n_step == 0
         self.data = []
         self.output_path = output_path
@@ -209,18 +208,19 @@ class Trainer():
         std_reward = np.std(np.array(rewards))
         return mean_reward, std_reward
 
-    def run(self):
+    def run(self, pps = False):
         while not self.global_counter.should_stop():
             print(self.global_counter.cur_step)
             # np.random.seed(self.env.seed)
             ob = self.env.reset()
+            # print("run first ob shape", len(ob))
+
             # note this done is pre-decision to reset LSTM states!
             done = True
             self.model.reset()
             self.cur_step = 0
             self.episode_rewards = []
             while True:
-                # print('22')
                 print(self.global_counter.cur_step)
                 ob, done, R = self.explore(ob, done)
                 dt = self.env.T - self.cur_step

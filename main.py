@@ -8,11 +8,11 @@ import configparser
 import logging
 import threading
 # from torch.utils.tensorboard.writer import SummaryWriter
-from torch.utils.tensorboard import SummaryWriter
+from tensorboardX import SummaryWriter
 from envs.cacc_env import CACCEnv
 from envs.large_grid_env import LargeGridEnv
 from envs.real_net_env import RealNetEnv
-from agents.models import IA2C, IA2C_FP, MA2C_NC, IA2C_CU, MA2C_CNET, MA2C_DIAL
+from agents.models import IA2C, IA2C_FP, MA2C_NC, IA2C_CU, MA2C_CNET, MA2C_DIAL, IPPO, MPPO
 from utils import (Counter, Trainer, Tester, Evaluator,
                    check_dir, copy_file, find_file,
                    init_dir, init_log, init_test_flag)
@@ -53,24 +53,36 @@ def init_env(config, port=0):
 
 def init_agent(env, config, total_step, seed):
     if env.agent == 'ia2c':
+        print('using ia2c')
+        print(env.n_s_ls)
         return IA2C(env.n_s_ls, env.n_a_ls, env.neighbor_mask, env.distance_mask, env.coop_gamma,
-                    total_step, config, seed=seed, use_gpu=True)
+                    total_step, config, seed=seed, use_gpu=False)
+    elif env.agent == 'ia2c_ippo':
+        print('using ippo')
+        print(env.n_s_ls)
+        return IPPO(env.n_s_ls, env.n_a_ls, env.neighbor_mask, env.distance_mask, env.coop_gamma,
+                       total_step, config, seed=seed, use_gpu=False)
+    elif env.agent == 'ma2c_ppo':
+        print('using mppo')
+        print(env.n_s_ls)
+        return MPPO(env.n_s_ls, env.n_a_ls, env.neighbor_mask, env.distance_mask, env.coop_gamma,
+                       total_step, config, seed=seed, use_gpu=False)
     elif env.agent == 'ia2c_fp':
         return IA2C_FP(env.n_s_ls, env.n_a_ls, env.neighbor_mask, env.distance_mask, env.coop_gamma,
-                       total_step, config, seed=seed, use_gpu=True)
+                       total_step, config, seed=seed, use_gpu=False)
     elif env.agent == 'ma2c_nc':
         return MA2C_NC(env.n_s_ls, env.n_a_ls, env.neighbor_mask, env.distance_mask, env.coop_gamma,
                        total_step, config, seed=seed, use_gpu=False)
     elif env.agent == 'ma2c_cnet':
         # this is actually CommNet
         return MA2C_CNET(env.n_s_ls, env.n_a_ls, env.neighbor_mask, env.distance_mask, env.coop_gamma,
-                         total_step, config, seed=seed, use_gpu=True)
+                         total_step, config, seed=seed, use_gpu=False)
     elif env.agent == 'ma2c_cu':
         return IA2C_CU(env.n_s_ls, env.n_a_ls, env.neighbor_mask, env.distance_mask, env.coop_gamma,
-                       total_step, config, seed=seed, use_gpu=True)
+                       total_step, config, seed=seed, use_gpu=False)
     elif env.agent == 'ma2c_dial':
         return MA2C_DIAL(env.n_s_ls, env.n_a_ls, env.neighbor_mask, env.distance_mask, env.coop_gamma,
-                         total_step, config, seed=seed, use_gpu=True)
+                         total_step, config, seed=seed, use_gpu=False)
     else:
         return None
 
@@ -86,6 +98,7 @@ def train(args):
 
     # init env
     env = init_env(config['ENV_CONFIG'])
+    print('env', env)
     logging.info('Training: a dim %r, agent dim: %d' % (env.n_a_ls, env.n_agent))
 
     # init step counter

@@ -6,7 +6,7 @@ from agents.utils import batch_to_seq, init_layer, one_hot, run_rnn
 
 
 class Policy(nn.Module):
-    def __init__(self, n_a, n_s, n_step, policy_name, agent_name, identical, device= 'cuda:0'):
+    def __init__(self, n_a, n_s, n_step, policy_name, agent_name, identical, device= 'cpu', reward_eps=None):
         super(Policy, self).__init__()
         self.name = policy_name
         if agent_name is not None:
@@ -17,6 +17,7 @@ class Policy(nn.Module):
         self.n_step = n_step
         self.identical = identical
         self.device = device
+        self.reward_eps = reward_eps
 
     def forward(self, ob, *_args, **_kwargs):
         raise NotImplementedError()
@@ -40,7 +41,7 @@ class Policy(nn.Module):
         self.critic_head = nn.Linear(n_h, 1)
         init_layer(self.critic_head, 'fc')
 
-    def _run_critic_head(self, h, na, n_n=None, device='cuda:0'):
+    def _run_critic_head(self, h, na, n_n=None, device='cpu'):
         h = h.to(device)
         if n_n is None:
             n_n = int(self.n_n)
@@ -59,9 +60,17 @@ class Policy(nn.Module):
             h = torch.cat([h, na_sparse], dim=1)
         return self.critic_head(h).squeeze()
 
-    def _run_loss(self, actor_dist, e_coef, v_coef, vs, As, Rs, Advs):
-        log_probs = actor_dist.log_prob(As)
-        policy_loss = -(log_probs * Advs).mean()
+    def _run_loss(self, actor_dist, e_coef, v_coef, vs, As, Rs, Advs, old_log_probs=None):
+        if old_log_probs == None:
+            log_probs = actor_dist.log_prob(As)
+            policy_loss = -(log_probs * Advs).mean()
+        else:
+            log_probs = actor_dist.log_prob(As)
+            ratio = torch.exp(log_probs - old_log_probs)
+            surr1 = ratio * Advs
+            surr2 = torch.clamp(ratio, 1 - self.reward_eps, 1 + self.reward_eps) * Advs   
+            policy_loss = -torch.mean(torch.min(surr1, surr2))
+
         entropy_loss = -(actor_dist.entropy()).mean() * e_coef
         value_loss = (Rs - vs).pow(2).mean() * v_coef
         return policy_loss, value_loss, entropy_loss
@@ -80,8 +89,8 @@ class Policy(nn.Module):
 
 class LstmPolicy(Policy):
     def __init__(self, n_s, n_a, n_n, n_step, n_fc=64, n_lstm=64, name=None,
-                 na_dim_ls=None, identical=True, device='cuda:0'):
-        super(LstmPolicy, self).__init__(n_a, n_s, n_step, 'lstm', name, identical)
+                 na_dim_ls=None, identical=True, device='cpu', reward_eps=None):
+        super(LstmPolicy, self).__init__(n_a, n_s, n_step, 'lstm', name, identical, reward_eps=reward_eps)
         if not self.identical:
             self.na_dim_ls = na_dim_ls
         self.n_lstm = n_lstm
@@ -92,7 +101,7 @@ class LstmPolicy(Policy):
         self.device = device
 
     def backward(self, obs, nactions, acts, dones, Rs, Advs,
-                 e_coef, v_coef, summary_writer=None, global_step=None):
+                 e_coef, v_coef, summary_writer=None, global_step=None, old_log_probs=None):
         obs = torch.from_numpy(obs).float().to(self.device)
         dones = torch.from_numpy(dones).float().to(self.device)
         xs = self._encode_ob(obs)
@@ -105,12 +114,24 @@ class LstmPolicy(Policy):
             self._run_loss(actor_dist, e_coef, v_coef, vs,
                            torch.from_numpy(acts).long().to(self.device),
                            torch.from_numpy(Rs).float().to(self.device),
-                           torch.from_numpy(Advs).float().to(self.device))
+                           torch.from_numpy(Advs).float().to(self.device),
+                           old_log_probs=old_log_probs
+                           )
         self.loss = self.policy_loss + self.value_loss + self.entropy_loss
         self.loss.backward()
         if summary_writer is not None:
             self._update_tensorboard(summary_writer, global_step)
 
+    def ppo_forward(self, obs, dones, acts, out_type= 'p'):
+        obs = torch.from_numpy(obs).float().to(self.device)
+        dones = torch.from_numpy(dones).float().to(self.device)
+        xs = self._encode_ob(obs)
+        hs, new_states = run_rnn(self.lstm_layer, xs, dones, self.states_bw)
+        # backward grad is limited to the minibatch
+        self.states_bw = new_states.detach()
+        actor_dist = torch.distributions.categorical.Categorical(logits=F.log_softmax(self.actor_head(hs), dim=1))
+        return actor_dist.log_prob(torch.from_numpy(acts).long())
+    
     def forward(self, ob, done, naction=None, out_type='p'):
         ob = torch.from_numpy(np.expand_dims(ob, axis=0)).float().to(self.device)
         done = torch.from_numpy(np.expand_dims(done, axis=0)).float().to(self.device)
@@ -175,7 +196,7 @@ class NCMultiAgentPolicy(Policy):
     and output dimensions are identical among all agents, and invalid values are casted as
     zeros during runtime."""
     def __init__(self, n_s, n_a, n_agent, n_step, neighbor_mask, n_fc=64, n_h=64,
-                 n_s_ls=None, n_a_ls=None, identical=True):
+                 n_s_ls=None, n_a_ls=None, identical=True, reward_eps=None):
         super(NCMultiAgentPolicy, self).__init__(n_a, n_s, n_step, 'nc', None, identical)
         if not self.identical:
             self.n_s_ls = n_s_ls
@@ -184,11 +205,12 @@ class NCMultiAgentPolicy(Policy):
         self.neighbor_mask = neighbor_mask
         self.n_fc = n_fc
         self.n_h = n_h
+        self.reward_eps = reward_eps
         self._init_net()
         self._reset()
 
     def backward(self, obs, fps, acts, dones, Rs, Advs,
-                 e_coef, v_coef, summary_writer=None, global_step=None):
+                 e_coef, v_coef, summary_writer=None, global_step=None, old_log_probs=None):
         obs = torch.from_numpy(obs).float().transpose(0, 1)
         dones = torch.from_numpy(dones).float()
         fps = torch.from_numpy(fps).float().transpose(0, 1)
@@ -207,7 +229,7 @@ class NCMultiAgentPolicy(Policy):
             actor_dist_i = torch.distributions.categorical.Categorical(logits=ps[i])
             policy_loss_i, value_loss_i, entropy_loss_i = \
                 self._run_loss(actor_dist_i, e_coef, v_coef, vs[i],
-                    acts[i], Rs[i], Advs[i])
+                    acts[i], Rs[i], Advs[i], old_log_probs[i])
             self.policy_loss += policy_loss_i
             self.value_loss += value_loss_i
             self.entropy_loss += entropy_loss_i
@@ -216,6 +238,26 @@ class NCMultiAgentPolicy(Policy):
         if summary_writer is not None:
             self._update_tensorboard(summary_writer, global_step)
 
+    def ppo_forward(self, obs, dones, fps, acts, action=None, out_type='p'):
+        obs = torch.from_numpy(obs).float().transpose(0, 1)
+        dones = torch.from_numpy(dones).float()
+        fps = torch.from_numpy(fps).float().transpose(0, 1)
+        hs, new_states = self._run_comm_layers(obs, dones, fps, self.states_bw)
+        self.states_bw = new_states.detach()
+        ps = self._run_actor_heads(hs)
+        ps_list = []
+        for i in range(len(ps)):
+            logits=F.log_softmax(ps[i], dim=1)
+            actor_dist = torch.distributions.categorical.Categorical(logits=logits)
+            ps_list.append(actor_dist.log_prob(torch.from_numpy(acts[i]).long()))
+        return ps_list
+        # ps_tensor = torch.zeros(size=(len(ps), ps[0].shape[0], ps[0].shape[1]))
+        # for i in range(len(ps)):
+        #     ps_tensor[i] = ps[i]
+        # logits=F.log_softmax(ps_tensor, dim=1)
+        # actor_dist = torch.distributions.categorical.Categorical(logits=logits)
+        # return actor_dist.log_prob(torch.from_numpy(acts).long())
+        
     def forward(self, ob, done, fp, action=None, out_type='p'):
         # TxNxm
         ob = torch.from_numpy(np.expand_dims(ob, axis=0)).float()
@@ -456,7 +498,7 @@ class CommNetMultiAgentPolicy(NCMultiAgentPolicy):
        Note in CommNet, the message is generated from hidden state only, so current state
        and neigbor policies are not included in the inputs."""
     def __init__(self, n_s, n_a, n_agent, n_step, neighbor_mask, n_fc=64, n_h=64,
-                 n_s_ls=None, n_a_ls=None, identical=True):
+                 n_s_ls=None, n_a_ls=None, identical=True, reward_eps=None):
         Policy.__init__(self, n_a, n_s, n_step, 'cnet', None, identical)
         if not self.identical:
             self.n_s_ls = n_s_ls
@@ -465,6 +507,7 @@ class CommNetMultiAgentPolicy(NCMultiAgentPolicy):
         self.neighbor_mask = neighbor_mask
         self.n_fc = n_fc
         self.n_h = n_h
+        self.reward_eps = reward_eps
         self._init_net()
         self._reset()
 

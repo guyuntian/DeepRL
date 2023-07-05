@@ -25,7 +25,7 @@ def batch_to_seq(x):
     return torch.chunk(x, n_step)
 
 
-def run_rnn(layer, xs, dones, s, device='cuda:0'):
+def run_rnn(layer, xs, dones, s, device='cpu'):
     xs = batch_to_seq(xs)
     # need dones to reset states
     dones = batch_to_seq(dones)
